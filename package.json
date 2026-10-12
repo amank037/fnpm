@@ -1,7 +1,7 @@
 {
   "name": "@amank037/fnpm",
   "author": "amank037",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Disk-efficient npm install replacement using a shared hardlink store",
   "bin": {
     "fnpm": "bin/fnpm.js"
