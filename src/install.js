@@ -49,6 +49,14 @@ function isSynced(marker, source, key, ignoreScripts) {
   );
 }
 
+function assertInside(projectDir, rel) {
+  const root = path.resolve(projectDir);
+  const abs = path.resolve(root, rel);
+  if (abs !== root && !abs.startsWith(root + path.sep)) {
+    throw new Error(`Path escapes project directory: ${rel}`);
+  }
+}
+
 function nodeModulesRoot(rel) {
   const idx = rel.indexOf("node_modules/");
   return rel.slice(0, idx + "node_modules".length);
@@ -116,6 +124,7 @@ async function install(projectDir, options = {}) {
   for (const entry of installable) roots.add(nodeModulesRoot(entry.path));
   for (const link of links) roots.add(nodeModulesRoot(link.path));
   for (const root of roots) {
+    assertInside(projectDir, root);
     await fsp.rm(path.join(projectDir, root), {
       recursive: true,
       force: true,
@@ -126,6 +135,7 @@ async function install(projectDir, options = {}) {
   await fsp.mkdir(nm, { recursive: true });
 
   for (const entry of installable) {
+    assertInside(projectDir, entry.path);
     await linkPackageIntoProject({
       storeDir: stores.get(entry.path),
       projectDir,
@@ -136,6 +146,7 @@ async function install(projectDir, options = {}) {
   }
 
   for (const link of links) {
+    assertInside(projectDir, link.path);
     await linkWorkspace({
       projectDir,
       installRelPath: link.path,

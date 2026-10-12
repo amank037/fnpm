@@ -71,6 +71,9 @@ function parseLockfile(lock) {
   const unsupported = [];
 
   for (const [rawPath, info] of Object.entries(packages)) {
+    if (/[\\:\0]/.test(rawPath)) {
+      throw new Error(`Refusing suspicious path in package-lock.json: ${rawPath}`);
+    }
     if (!rawPath || !info || typeof info !== "object") continue;
 
     const rel = path.posix.normalize(rawPath);
