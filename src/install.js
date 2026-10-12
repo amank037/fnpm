@@ -2,122 +2,188 @@
 const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
-const os = require("os");
-const { spawnSync } = require("child_process");
-const { hashFile, parseLockfile } = require("./lockfile");
+const { hashFile, manifestHash, parseLockfile } = require("./lockfile");
+const { loadConfig } = require("./config");
+const { shouldSkipForPlatform } = require("./platform");
 const { addPackageToStore } = require("./store");
-const { linkPackageIntoProject } = require("./link");
+const { linkPackageIntoProject, linkWorkspace } = require("./link");
+const { runInstallScripts, orderForScripts } = require("./scripts");
+const {
+  readPackageJson,
+  inspectLockfile,
+  regenerateLockfile,
+  resolveWithoutWriting,
+} = require("./resolve");
 
-function shouldSkipPlatformOptional(rawPkg) {
-  if (!rawPkg || !rawPkg.optional) return false;
+const MARKER = ".fnpm-synced";
+const FETCH_CONCURRENCY = 8;
 
-  const currentOs = os.platform();
-  const currentCpu = os.arch();
-
-  if (Array.isArray(rawPkg.os)) {
-    const negated = rawPkg.os
-      .filter((s) => s.startsWith("!"))
-      .map((s) => s.slice(1));
-    const allowed = rawPkg.os.filter((s) => !s.startsWith("!"));
-
-    if (negated.length > 0 && negated.includes(currentOs)) return true;
-    if (allowed.length > 0 && !allowed.includes(currentOs)) return true;
-  }
-
-  if (Array.isArray(rawPkg.cpu)) {
-    const negated = rawPkg.cpu
-      .filter((s) => s.startsWith("!"))
-      .map((s) => s.slice(1));
-    const allowed = rawPkg.cpu.filter((s) => !s.startsWith("!"));
-
-    if (negated.length > 0 && negated.includes(currentCpu)) return true;
-    if (allowed.length > 0 && !allowed.includes(currentCpu)) return true;
-  }
-
-  return false;
+async function mapLimit(items, limit, fn) {
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (next < items.length) {
+        const item = items[next++];
+        await fn(item);
+      }
+    },
+  );
+  await Promise.all(workers);
 }
 
-async function install(projectDir) {
-  const lf = path.join(projectDir, "package-lock.json");
-  if (!fs.existsSync(lf)) {
-    console.log(
-      "No package-lock.json. Running npm install --package-lock-only...",
-    );
-    if (
-      spawnSync("npm", ["install", "--package-lock-only"], {
-        cwd: projectDir,
-        stdio: "inherit",
-      }).status !== 0
-    )
-      throw new Error("Failed to generate package-lock.json");
-  }
-
-  const hash = hashFile(lf);
-  const nm = path.join(projectDir, "node_modules");
-  const marker = path.join(nm, ".fnpm-synced");
-
-  if (fs.existsSync(nm)) {
-    try {
-      if (
-        JSON.parse(await fsp.readFile(marker, "utf8")).lockfileHash === hash
-      ) {
-        console.log("already up to date");
-        return;
-      }
-    } catch {}
-  }
-
-  let lockfileRaw;
+async function readMarker(nm) {
   try {
-    lockfileRaw = JSON.parse(fs.readFileSync(lf, "utf8"));
-  } catch (err) {
-    throw new Error(`Failed to parse package-lock.json: ${err.message}`);
+    return JSON.parse(await fsp.readFile(path.join(nm, MARKER), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isSynced(marker, source, key, ignoreScripts) {
+  return (
+    Boolean(marker) &&
+    marker.source === source &&
+    marker.key === key &&
+    Boolean(marker.ignoreScripts) === ignoreScripts
+  );
+}
+
+function nodeModulesRoot(rel) {
+  const idx = rel.indexOf("node_modules/");
+  return rel.slice(0, idx + "node_modules".length);
+}
+
+async function install(projectDir, options = {}) {
+  const { ignoreScripts = false, writeLockfile = true } = options;
+  const nm = path.join(projectDir, "node_modules");
+
+  const pkg = readPackageJson(projectDir);
+  const existing = inspectLockfile(projectDir, pkg);
+  const config = loadConfig(projectDir);
+
+  let source;
+  let key = null;
+  if (existing.fresh) {
+    source = "lockfile";
+    key = hashFile(existing.lockfilePath);
+  } else if (writeLockfile) {
+    source = "lockfile";
+  } else {
+    source = "resolved";
+    key = manifestHash(pkg);
   }
 
-  const pkgs = parseLockfile(lf).sort((a, b) => a.path.localeCompare(b.path));
+  const upToDate = async () =>
+    fs.existsSync(nm) &&
+    key !== null &&
+    isSynced(await readMarker(nm), source, key, ignoreScripts);
 
-  const filteredPkgs = pkgs.filter((p) => {
-    const rawPkg = lockfileRaw.packages && lockfileRaw.packages[p.path];
-    if (shouldSkipPlatformOptional(rawPkg)) return false;
-    return true;
+  if (await upToDate()) {
+    console.log("already up to date");
+    return;
+  }
+
+  let lock;
+  if (existing.fresh) {
+    lock = existing.lock;
+  } else if (writeLockfile) {
+    lock = regenerateLockfile(projectDir);
+    key = hashFile(existing.lockfilePath);
+    if (await upToDate()) {
+      console.log("already up to date");
+      return;
+    }
+  } else {
+    lock = resolveWithoutWriting(projectDir, existing);
+  }
+
+  const { entries, links, unsupported } = parseLockfile(lock);
+  const installable = entries.filter((e) => !shouldSkipForPlatform(e));
+  const skippedCount = entries.length - installable.length;
+
+  const stores = new Map();
+  const fetchedDirs = new Set();
+  if (installable.length > 0)
+    console.log(`Preparing ${installable.length} package(s)...`);
+  await mapLimit(installable, FETCH_CONCURRENCY, async (entry) => {
+    const result = await addPackageToStore(entry, config);
+    stores.set(entry.path, result.dir);
+    if (result.fetched) fetchedDirs.add(result.dir);
   });
 
-  const skippedCount = pkgs.length - filteredPkgs.length;
-
-  if (fs.existsSync(nm))
-    await fsp.rm(nm, {
+  const roots = new Set(["node_modules"]);
+  for (const entry of installable) roots.add(nodeModulesRoot(entry.path));
+  for (const link of links) roots.add(nodeModulesRoot(link.path));
+  for (const root of roots) {
+    await fsp.rm(path.join(projectDir, root), {
       recursive: true,
       force: true,
       maxRetries: 3,
       retryDelay: 50,
     });
-
+  }
   await fsp.mkdir(nm, { recursive: true });
 
-  for (const p of filteredPkgs) {
-    const store = await addPackageToStore(p);
+  for (const entry of installable) {
     await linkPackageIntoProject({
-      storeDir: store,
+      storeDir: stores.get(entry.path),
       projectDir,
-      installRelPath: p.path,
-      name: p.name,
+      installRelPath: entry.path,
+      name: entry.name,
+      forceCopy: !ignoreScripts && entry.hasInstallScript,
     });
   }
 
-  await fsp.writeFile(
-    marker,
-    JSON.stringify(
-      { lockfileHash: hash, syncedAt: new Date().toISOString() },
-      null,
-      2,
-    ),
-  );
-
-  let msg = `fnpm install complete: ${filteredPkgs.length} package(s) linked.`;
-  if (skippedCount > 0) {
-    msg += ` (${skippedCount} platform-optional package(s) skipped.)`;
+  for (const link of links) {
+    await linkWorkspace({
+      projectDir,
+      installRelPath: link.path,
+      target: link.target,
+      name: link.name,
+    });
   }
-  console.log(msg);
+
+  if (!ignoreScripts) {
+    const withScripts = orderForScripts(installable, lock.packages).filter(
+      (e) => e.hasInstallScript,
+    );
+    if (withScripts.length > 0) {
+      console.log("Running install scripts...");
+      await runInstallScripts({ projectDir, packages: withScripts });
+    }
+  }
+
+  if (unsupported.length === 0) {
+    await fsp.writeFile(
+      path.join(nm, MARKER),
+      JSON.stringify(
+        { source, key, ignoreScripts, syncedAt: new Date().toISOString() },
+        null,
+        2,
+      ),
+    );
+  }
+
+  let msg = `fnpm install complete: ${installable.length + links.length} package(s) linked`;
+  const notes = [];
+  if (fetchedDirs.size > 0) notes.push(`${fetchedDirs.size} downloaded`);
+  if (skippedCount > 0) notes.push(`${skippedCount} platform-optional skipped`);
+  if (notes.length > 0) msg += ` (${notes.join(", ")})`;
+  console.log(`${msg}.`);
+
+  if (unsupported.length > 0) {
+    console.warn(
+      `\nfnpm warning: ${unsupported.length} package(s) were NOT installed because fnpm cannot handle them:`,
+    );
+    for (const item of unsupported) {
+      console.warn(`  ${item.path}  (${item.reason})`);
+    }
+    console.warn(
+      "Use npm for these (for example by pinning registry versions), or run `npm install` instead.",
+    );
+    process.exitCode = 1;
+  }
 }
 
 module.exports = { install };
